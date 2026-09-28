@@ -140,6 +140,48 @@ public class ObjectInitializerTests
         await Assert.That(ObjectInitializer.IsInitialized(fixture)).IsTrue();
     }
 
+    [Test]
+    [Arguments(true)]
+    [Arguments(false)]
+    public async Task Waiters_Resume_Off_The_Thread_That_Completes_A_Synchronously_Blocking_Initialization(bool cancellableWait)
+    {
+        using var fixture = new BlockingPrefixInitializer(completeSynchronously: true);
+        using var cancellationTokenSource = new CancellationTokenSource();
+        var cancellationToken = cancellableWait ? cancellationTokenSource.Token : CancellationToken.None;
+        var initializingThreadId = 0;
+        var initializingCallReturned = false;
+        Task<bool> waiterResumedInline = Task.FromResult(false);
+
+        var initialization = Task.Run(() =>
+        {
+            Volatile.Write(ref initializingThreadId, Environment.CurrentManagedThreadId);
+            var pending = ObjectInitializer.InitializeAsync(fixture, cancellationToken);
+            Volatile.Write(ref initializingCallReturned, true);
+            return pending.AsTask();
+        });
+
+        try
+        {
+            await fixture.PrefixEntered.Task.WaitAsync(HangTimeout);
+            // Registers its continuation while InitializeAsync is still blocked in its synchronous part.
+            waiterResumedInline = ResumedInlineAsync(ObjectInitializer.InitializeAsync(fixture, cancellationToken));
+        }
+        finally
+        {
+            fixture.ReleasePrefix();
+        }
+
+        await initialization.WaitAsync(HangTimeout);
+        await Assert.That(await waiterResumedInline.WaitAsync(HangTimeout)).IsFalse();
+
+        async Task<bool> ResumedInlineAsync(ValueTask pending)
+        {
+            await pending.ConfigureAwait(false);
+            return !Volatile.Read(ref initializingCallReturned)
+                   && Environment.CurrentManagedThreadId == Volatile.Read(ref initializingThreadId);
+        }
+    }
+
     private static async Task<Exception?> CaptureAsync(Task task)
     {
         try
@@ -157,7 +199,7 @@ public class ObjectInitializerTests
     /// Blocks inside the synchronous part of InitializeAsync (before its first await), like
     /// sync-over-async code in a third-party constructor would.
     /// </summary>
-    private sealed class BlockingPrefixInitializer : IAsyncInitializer, IDisposable
+    private sealed class BlockingPrefixInitializer(bool completeSynchronously = false) : IAsyncInitializer, IDisposable
     {
         private readonly ManualResetEventSlim _prefixGate = new();
         private int _initializeCount;
@@ -168,15 +210,17 @@ public class ObjectInitializerTests
 
         public void ReleasePrefix() => _prefixGate.Set();
 
-        public async Task InitializeAsync()
+        public Task InitializeAsync()
         {
             Interlocked.Increment(ref _initializeCount);
             PrefixEntered.TrySetResult(true);
             _prefixGate.Wait(PrefixGateTimeout);
-            await Task.Yield();
+            return completeSynchronously ? Task.CompletedTask : YieldAsync();
         }
 
         public void Dispose() => _prefixGate.Dispose();
+
+        private static async Task YieldAsync() => await Task.Yield();
     }
 
     /// <summary>

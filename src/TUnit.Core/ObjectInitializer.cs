@@ -125,6 +125,8 @@ internal static class ObjectInitializer
                 // Only the caller that published the task runs InitializeAsync - inline up to its
                 // first await, as before, but with no lock held (#6904).
                 _ = RunInitializerAsync(asyncInitializer, completionSource);
+                await initializationTask.WaitAsync(cancellationToken);
+                return;
             }
         }
 
@@ -132,7 +134,23 @@ internal static class ObjectInitializer
         // immediately. Removing and retrying can cause hangs when InitializeAsync partially
         // initialized resources (e.g. started ports/processes) that block re-initialization (#4715).
         // The cancellation token only stops this caller waiting; the initialization keeps running.
-        await initializationTask.WaitAsync(cancellationToken);
+        if (initializationTask.IsCompleted)
+        {
+            await initializationTask;
+            return;
+        }
+
+        try
+        {
+            await initializationTask.WaitAsync(cancellationToken);
+        }
+        finally
+        {
+            // Another caller was still initializing. Its completion would otherwise run every waiting
+            // caller inline, one after another, on the thread that completed it - carrying each of them
+            // (and their test workers) on to their next tests there, on one thread.
+            await Task.Yield();
+        }
     }
 
     private static async Task RunInitializerAsync(IAsyncInitializer asyncInitializer, TaskCompletionSource<bool> completionSource)
