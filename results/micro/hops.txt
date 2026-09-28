@@ -1,0 +1,14 @@
+Sync   Current_Lazy                 work items per initialization: 0.000
+Sync   Proposed_Tcs                 work items per initialization: 0.000
+Sync   Maintainer_Shape             work items per initialization: 0.000
+Sync   Final_MaintainerShapeAsync   work items per initialization: 0.000
+Sync   Final_WaiterYield            work items per initialization: 0.000
+Sync   PlainTcs_WinnerAwaitsSource  work items per initialization: 0.000
+Sync   TaskRun_Issue                work items per initialization: 1.020
+Async  Current_Lazy                 work items per initialization: 1.065
+Async  Proposed_Tcs                 work items per initialization: 1.067
+Async  Maintainer_Shape             work items per initialization: 1.025
+Async  Final_MaintainerShapeAsync   work items per initialization: 1.079
+Async  Final_WaiterYield            work items per initialization: 1.065
+Async  PlainTcs_WinnerAwaitsSource  work items per initialization: 2.020
+Async  TaskRun_Issue                work items per initialization: 2.011

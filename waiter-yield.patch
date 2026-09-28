@@ -1,0 +1,147 @@
+From 6f1c971107402a0bfe7d320043f377514b77f0bb Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 28 Sep 2026 15:08:42 +0000
+Subject: [PATCH] fix: resume callers that waited on a shared initialization on
+ their own threads
+
+Without RunContinuationsAsynchronously, completing the shared task runs every
+waiting caller's continuation inline, one after another, on the thread that
+completed it. When InitializeAsync blocks and then completes synchronously,
+each continuation carries its test worker on through its next tests on that
+thread, so the rest of the run collapses onto one thread; on main those
+callers were blocked in Monitor.Enter and resumed on their own threads.
+
+Callers that find the initialization still running now yield after waiting.
+The caller that runs InitializeAsync and callers of an already-initialized
+object are unchanged and pay no extra thread-pool hop.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SZ1LwaBqCw5AJXeAU1vVo4
+---
+ src/TUnit.Core/ObjectInitializer.cs           | 20 +++++++-
+ .../TUnit.UnitTests/ObjectInitializerTests.cs | 50 +++++++++++++++++--
+ 2 files changed, 66 insertions(+), 4 deletions(-)
+
+diff --git a/src/TUnit.Core/ObjectInitializer.cs b/src/TUnit.Core/ObjectInitializer.cs
+index b5d627a..101085f 100644
+--- a/src/TUnit.Core/ObjectInitializer.cs
++++ b/src/TUnit.Core/ObjectInitializer.cs
+@@ -125,6 +125,8 @@ internal static void ClearCache()
+                 // Only the caller that published the task runs InitializeAsync - inline up to its
+                 // first await, as before, but with no lock held (#6904).
+                 _ = RunInitializerAsync(asyncInitializer, completionSource);
++                await initializationTask.WaitAsync(cancellationToken);
++                return;
+             }
+         }
+ 
+@@ -132,7 +134,23 @@ internal static void ClearCache()
+         // immediately. Removing and retrying can cause hangs when InitializeAsync partially
+         // initialized resources (e.g. started ports/processes) that block re-initialization (#4715).
+         // The cancellation token only stops this caller waiting; the initialization keeps running.
+-        await initializationTask.WaitAsync(cancellationToken);
++        if (initializationTask.IsCompleted)
++        {
++            await initializationTask;
++            return;
++        }
++
++        try
++        {
++            await initializationTask.WaitAsync(cancellationToken);
++        }
++        finally
++        {
++            // Another caller was still initializing. Its completion would otherwise run every waiting
++            // caller inline, one after another, on the thread that completed it - carrying each of them
++            // (and their test workers) on to their next tests there, on one thread.
++            await Task.Yield();
++        }
+     }
+ 
+     private static async Task RunInitializerAsync(IAsyncInitializer asyncInitializer, TaskCompletionSource<bool> completionSource)
+diff --git a/tests/TUnit.UnitTests/ObjectInitializerTests.cs b/tests/TUnit.UnitTests/ObjectInitializerTests.cs
+index 0c09beb..cec0aa4 100644
+--- a/tests/TUnit.UnitTests/ObjectInitializerTests.cs
++++ b/tests/TUnit.UnitTests/ObjectInitializerTests.cs
+@@ -140,6 +140,48 @@ public async Task Cancelling_A_Waiting_Caller_Does_Not_Cancel_The_Initialization
+         await Assert.That(ObjectInitializer.IsInitialized(fixture)).IsTrue();
+     }
+ 
++    [Test]
++    [Arguments(true)]
++    [Arguments(false)]
++    public async Task Waiters_Resume_Off_The_Thread_That_Completes_A_Synchronously_Blocking_Initialization(bool cancellableWait)
++    {
++        using var fixture = new BlockingPrefixInitializer(completeSynchronously: true);
++        using var cancellationTokenSource = new CancellationTokenSource();
++        var cancellationToken = cancellableWait ? cancellationTokenSource.Token : CancellationToken.None;
++        var initializingThreadId = 0;
++        var initializingCallReturned = false;
++        Task<bool> waiterResumedInline = Task.FromResult(false);
++
++        var initialization = Task.Run(() =>
++        {
++            Volatile.Write(ref initializingThreadId, Environment.CurrentManagedThreadId);
++            var pending = ObjectInitializer.InitializeAsync(fixture, cancellationToken);
++            Volatile.Write(ref initializingCallReturned, true);
++            return pending.AsTask();
++        });
++
++        try
++        {
++            await fixture.PrefixEntered.Task.WaitAsync(HangTimeout);
++            // Registers its continuation while InitializeAsync is still blocked in its synchronous part.
++            waiterResumedInline = ResumedInlineAsync(ObjectInitializer.InitializeAsync(fixture, cancellationToken));
++        }
++        finally
++        {
++            fixture.ReleasePrefix();
++        }
++
++        await initialization.WaitAsync(HangTimeout);
++        await Assert.That(await waiterResumedInline.WaitAsync(HangTimeout)).IsFalse();
++
++        async Task<bool> ResumedInlineAsync(ValueTask pending)
++        {
++            await pending.ConfigureAwait(false);
++            return !Volatile.Read(ref initializingCallReturned)
++                   && Environment.CurrentManagedThreadId == Volatile.Read(ref initializingThreadId);
++        }
++    }
++
+     private static async Task<Exception?> CaptureAsync(Task task)
+     {
+         try
+@@ -157,7 +199,7 @@ public async Task Cancelling_A_Waiting_Caller_Does_Not_Cancel_The_Initialization
+     /// Blocks inside the synchronous part of InitializeAsync (before its first await), like
+     /// sync-over-async code in a third-party constructor would.
+     /// </summary>
+-    private sealed class BlockingPrefixInitializer : IAsyncInitializer, IDisposable
++    private sealed class BlockingPrefixInitializer(bool completeSynchronously = false) : IAsyncInitializer, IDisposable
+     {
+         private readonly ManualResetEventSlim _prefixGate = new();
+         private int _initializeCount;
+@@ -168,15 +210,17 @@ private sealed class BlockingPrefixInitializer : IAsyncInitializer, IDisposable
+ 
+         public void ReleasePrefix() => _prefixGate.Set();
+ 
+-        public async Task InitializeAsync()
++        public Task InitializeAsync()
+         {
+             Interlocked.Increment(ref _initializeCount);
+             PrefixEntered.TrySetResult(true);
+             _prefixGate.Wait(PrefixGateTimeout);
+-            await Task.Yield();
++            return completeSynchronously ? Task.CompletedTask : YieldAsync();
+         }
+ 
+         public void Dispose() => _prefixGate.Dispose();
++
++        private static async Task YieldAsync() => await Task.Yield();
+     }
+ 
+     /// <summary>
+-- 
+2.43.0
+
